@@ -302,10 +302,14 @@ export function apply(ctx: Context): void {
   ctx.effect(() => ctx.orchestrator.sources.register(sentryKind), 'sentry: source kind')
   ctx.effect(() => {
     const source = sourceContext(ctx.orchestrator, sentryKind)
+    // Read the credentials service by name instead of injecting it, so a composition
+    // without a credential store still loads this Source and falls back to the
+    // environment rather than failing to start.
+    const resolve = credentialResolver(ctx.get('credentials'))
     const controller = new AbortController()
     // An unhandled rejection terminates the DSH process, so a failure escaping the
     // polling loop is reported as source health instead.
-    const running = watch(source, controller.signal).catch((error: unknown) => {
+    const running = watch(source, resolve, controller.signal).catch((error: unknown) => {
       source.report('sentry', { state: 'error', detail: String(error) })
     })
     return async () => {
@@ -322,7 +326,7 @@ export function pollFailure(failures: number, threshold: number, error: unknown)
     : undefined
 }
 
-async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
+async function watch(ctx: SourceContext, resolve: CredentialResolver, signal: AbortSignal): Promise<void> {
   let failures = 0
   await ctx.ready
   if (!ctx.configured()) {
@@ -333,7 +337,7 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
     const config = ctx.config<SentryConfig>(SOURCE)
     try {
       if (config) {
-        await pollRound(ctx, config, signal)
+        await pollRound(ctx, config, resolve, signal)
         ctx.report('sentry', { state: 'ready', detail: 'polling' })
       } else ctx.report('sentry', health('paused', 'sourceOff'))
       failures = 0
@@ -346,11 +350,41 @@ async function watch(ctx: SourceContext, signal: AbortSignal): Promise<void> {
   }
 }
 
-/** The Sentry token, read from the environment variable the configuration names. */
-export function tokenOf(config: SentryConfig, env: Record<string, string | undefined>): string {
-  const value = env[config.tokenEnv]?.trim()
-  if (!value) throw new Error(`The environment variable ${config.tokenEnv} is not set`)
+/**
+ * Reads a credential by name, in DSH's precedence order.
+ *
+ * Not `process.env`. DSH resolves credentials from its store first and the launching
+ * environment second, and the environment layer is a snapshot taken at launch — a
+ * value saved to `.credentials.yaml` never appears in `process.env`. Reading the
+ * environment directly would therefore miss every token a user saved through the
+ * product, which is the normal way to configure one.
+ */
+export type CredentialResolver = (name: string) => Promise<string | undefined>
+
+/** The Sentry token, or a thrown error naming the variable the operator must set. */
+export async function resolveToken(config: SentryConfig, resolve: CredentialResolver): Promise<string> {
+  const value = (await resolve(config.tokenEnv))?.trim()
+  if (!value) {
+    throw new Error(
+      `${config.tokenEnv} is not set. Save it in the credentials store, or export it before launching DSH.`,
+    )
+  }
   return value
+}
+
+/** Builds the resolver from the credentials service, falling back to the raw environment. */
+export function credentialResolver(credentials: unknown): CredentialResolver {
+  const service = credentials as { resolve?(ref: string): Promise<{ value?: string } | undefined> } | undefined
+  return async name => {
+    if (typeof service?.resolve === 'function') {
+      // `credentialRef` is a compile-time brand on a plain string, so the bare name is
+      // what the service expects at runtime. A provider error must not look like an
+      // unset token, so it is surfaced rather than swallowed into `undefined`.
+      const hit = await service.resolve(name)
+      if (hit && typeof hit.value === 'string' && hit.value.trim()) return hit.value
+    }
+    return process.env[name]
+  }
 }
 
 /** Builds the list URL. `lastSeen` is bounded by the cursor so each poll reads only recent Issues. */
@@ -366,13 +400,13 @@ export function issuesUrl(config: SentryConfig, since: string | undefined): stri
 /** Reads recent Sentry Issues; parsing skips entries that do not match the shape. */
 export async function fetchIssues(
   config: SentryConfig,
-  env: Record<string, string | undefined>,
+  token: string,
   since: string | undefined,
   signal: AbortSignal,
   fetchImpl: typeof fetch = fetch,
 ): Promise<SentryIssue[]> {
   const response = await fetchImpl(issuesUrl(config, since), {
-    headers: { authorization: `Bearer ${tokenOf(config, env)}`, accept: 'application/json' },
+    headers: { authorization: `Bearer ${token}`, accept: 'application/json' },
     signal,
   })
   if (!response.ok) {
@@ -390,11 +424,17 @@ export async function fetchIssues(
 }
 
 /** Mirrors each admitted, not-yet-mirrored Issue, at most `maxPerPoll` of them. */
-async function pollRound(ctx: SourceContext, config: SentryConfig, signal: AbortSignal): Promise<void> {
+async function pollRound(
+  ctx: SourceContext,
+  config: SentryConfig,
+  resolve: CredentialResolver,
+  signal: AbortSignal,
+): Promise<void> {
   if (!config.organization || !config.project) return
   if (!hasRepository(ctx)) return
   const since = ctx.state.get(cursor)
-  const issues = await fetchIssues(config, process.env, since, signal)
+  const token = await resolveToken(config, resolve)
+  const issues = await fetchIssues(config, token, since, signal)
   if (issues.length === 0) return
   const newest = issues.reduce((latest, issue) => {
     const at = issue.lastSeen ?? ''

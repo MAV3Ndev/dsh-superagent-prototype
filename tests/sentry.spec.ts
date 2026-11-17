@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
-  admit, fetchIssues, issueBody, issuesUrl, pollFailure, sentryKind, tokenOf,
+  admit, credentialResolver, fetchIssues, issueBody, issuesUrl, pollFailure, resolveToken, sentryKind,
   type SentryConfig,
 } from '../src/sources/sentry.ts'
 
 const config = (overrides: Partial<SentryConfig> = {}): SentryConfig =>
   sentryKind.schema.parse({ organization: 'acme', project: 'web', ...overrides })
 
-/** The environment a poll reads the token from; matches the default `tokenEnv`. */
-const ENV = { SENTRY_AUTH_TOKEN: 't' }
+/** A resolver that answers from a plain record, standing in for the credentials service. */
+const fromRecord = (record: Record<string, string | undefined>) => async (name: string) => record[name]
 
 /** One Sentry Issue as the list endpoint returns it. */
 const raw = (overrides: Record<string, unknown> = {}) => ({
@@ -21,7 +21,7 @@ const raw = (overrides: Record<string, unknown> = {}) => ({
 /** Feeds raw entries through the Source's own fetch so the schema is exercised, not bypassed. */
 const parse = async (entries: unknown[], overrides: Partial<SentryConfig> = {}) => {
   const response = { ok: true, json: async () => entries, text: async () => '' } as unknown as Response
-  return fetchIssues(config(overrides), ENV, undefined, new AbortController().signal, async () => response)
+  return fetchIssues(config(overrides), 't', undefined, new AbortController().signal, async () => response)
 }
 
 /** One parsed Issue, for the helpers that take the normalized shape. */
@@ -30,18 +30,58 @@ const one = async (overrides: Record<string, unknown> = {}) => (await parse([raw
 describe('sentry source: configuration', () => {
   it('stores the token variable name rather than a token', () => {
     // A token in settings would be persisted in the state database and shown in the
-    // panel. The schema holds only the variable name; `tokenOf` reads it at use.
+    // panel. The schema holds only the variable name; the resolver reads the value.
     const parsed = config()
     expect(parsed.tokenEnv).toBe('SENTRY_AUTH_TOKEN')
     expect(Object.keys(parsed)).not.toContain('token')
-    expect(tokenOf(parsed, { SENTRY_AUTH_TOKEN: '  secret  ' })).toBe('secret')
   })
 
-  it('refuses to poll without a token instead of reporting an empty result', () => {
+  it('reads the token through the credential resolver, not the process environment', async () => {
+    // DSH resolves credentials from its store first and the launch environment second,
+    // and the environment layer is a snapshot taken at launch. A token saved to
+    // .credentials.yaml therefore never appears in process.env, so reading env directly
+    // would miss the normal way a user configures one.
+    const resolved: string[] = []
+    const token = await resolveToken(config(), async name => {
+      resolved.push(name)
+      return '  from-store  '
+    })
+    expect(token).toBe('from-store')
+    expect(resolved).toEqual(['SENTRY_AUTH_TOKEN'])
+  })
+
+  it('falls back to the process environment only when the store has no value', async () => {
+    process.env.SENTRY_RESOLVER_TEST = 'from-env'
+    try {
+      const resolver = credentialResolver(undefined)
+      expect(await resolver('SENTRY_RESOLVER_TEST')).toBe('from-env')
+      expect(await resolver('SENTRY_NOT_SET_ANYWHERE')).toBeUndefined()
+    } finally {
+      delete process.env.SENTRY_RESOLVER_TEST
+    }
+  })
+
+  it('prefers the credential store over the environment when both answer', async () => {
+    process.env.SENTRY_PRECEDENCE_TEST = 'from-env'
+    try {
+      const service = { resolve: async () => ({ value: 'from-store' }) }
+      const resolver = credentialResolver(service)
+      expect(await resolver('SENTRY_PRECEDENCE_TEST')).toBe('from-store')
+      // An empty stored value counts as absent, so the environment applies again.
+      const blank = credentialResolver({ resolve: async () => ({ value: '   ' }) })
+      expect(await blank('SENTRY_PRECEDENCE_TEST')).toBe('from-env')
+    } finally {
+      delete process.env.SENTRY_PRECEDENCE_TEST
+    }
+  })
+
+  it('refuses to poll without a token instead of reporting an empty result', async () => {
     // A missing token must look like an error. Returning no Issues would look like a
     // healthy project with nothing to report.
-    expect(() => tokenOf(config(), {})).toThrow(/SENTRY_AUTH_TOKEN/)
-    expect(() => tokenOf(config(), { SENTRY_AUTH_TOKEN: '   ' })).toThrow(/SENTRY_AUTH_TOKEN/)
+    await expect(resolveToken(config(), fromRecord({}))).rejects.toThrow(/SENTRY_AUTH_TOKEN/)
+    await expect(resolveToken(config(), fromRecord({ SENTRY_AUTH_TOKEN: '   ' }))).rejects.toThrow(/SENTRY_AUTH_TOKEN/)
+    // The error has to say where to put it, because this is the first thing an operator hits.
+    await expect(resolveToken(config(), fromRecord({}))).rejects.toThrow(/credentials store/)
   })
 
   it('defaults to receiving nothing until an organization and project are set', () => {
@@ -105,7 +145,7 @@ describe('sentry source: the request it makes', () => {
 
   it('reports an HTTP failure rather than returning no issues', async () => {
     const response = { ok: false, status: 403, text: async () => 'nope' } as unknown as Response
-    await expect(fetchIssues(config(), ENV, undefined, new AbortController().signal, async () => response))
+    await expect(fetchIssues(config(), 't', undefined, new AbortController().signal, async () => response))
       .rejects.toThrow(/403/)
   })
 
@@ -119,7 +159,7 @@ describe('sentry source: the request it makes', () => {
       Object.assign(seen, init.headers as Record<string, string>)
       return { ok: true, json: async () => [], text: async () => '' } as unknown as Response
     }) as unknown as typeof fetch
-    await fetchIssues(config(), { SENTRY_AUTH_TOKEN: token }, undefined, new AbortController().signal, spy)
+    await fetchIssues(config(), token, undefined, new AbortController().signal, spy)
     expect(seen['authorization']).toBe(`Bearer ${token}`)
   })
 
@@ -170,8 +210,12 @@ describe('sentry source: plugin entry', () => {
       context: () => ({ report, ready: Promise.resolve(), configured: () => false, config: () => undefined }),
     }
     const effect = vi.fn((run: () => unknown) => { run(); return () => {} })
-    apply({ orchestrator, effect } as never)
+    // The credentials service is looked up by name, so a composition without one must
+    // still load: `get` returning undefined is the normal case for a bare profile.
+    const get = vi.fn(() => undefined)
+    apply({ orchestrator, effect, get } as never)
     expect(register).toHaveBeenCalledWith(sentryKind)
+    expect(get).toHaveBeenCalledWith('credentials')
 
     // The polling loop must report why it is idle rather than looking healthy.
     await vi.waitFor(() => expect(report).toHaveBeenCalled())
