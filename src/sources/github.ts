@@ -25,9 +25,28 @@ const NotificationSchema = z.looseObject({
 const GithubConfigSchema = GithubAccountsSchema.extend({ pollSeconds: z.number().int().min(60).max(3600).default(60),
   failuresBeforeError: z.number().int().min(1).max(20).default(3),
   observeIssues: z.boolean().default(false), observePulls: z.boolean().default(false), observeComments: z.boolean().default(false),
-  observeCi: z.boolean().default(false) }).strict()
+  observeCi: z.boolean().default(false),
+  /** Labels that let an Issue the agent itself opened through, comma-separated; empty disables the exception. */
+  ownLabels: z.string().default(''),
+}).strict()
 export type GithubConfig = z.infer<typeof GithubConfigSchema>
 const OBSERVED = { issues: 'observeIssues', pulls: 'observePulls', comments: 'observeComments', ci: 'observeCi' } as const
+/**
+ * Whether a listed item carries any of the comma-separated `ownLabels`.
+ *
+ * `CommentSchema` is a loose object, so GitHub's `labels` array survives parsing without
+ * being named in the schema; an item without labels, or a configuration without any,
+ * never matches. Matching is by name and case-insensitive, because an operator types the
+ * label from the repository's label list rather than from the API.
+ */
+export function carriesLabel(item: unknown, ownLabels: string): boolean {
+  // An empty configuration yields an empty list, which matches nothing — so leaving the field
+  // blank cannot accidentally turn the self-echo guard off for every item.
+  const wanted = ownLabels.split(',').map(name => name.trim().toLowerCase()).filter(Boolean)
+  const labels = (item as { labels?: { name?: unknown }[] } | null)?.labels
+  if (!Array.isArray(labels)) return false
+  return labels.some(label => typeof label?.name === 'string' && wanted.includes(label.name.trim().toLowerCase()))
+}
 type Scope = keyof typeof OBSERVED
 function scopeOf(meta: Record<string, unknown>): Scope | undefined {
   if (meta.ci === true) return typeof meta.branch === 'string' ? 'ci' : undefined
@@ -54,10 +73,13 @@ export const githubKind: SourceKind<GithubConfig> = {
     { key: 'observeComments', type: 'switch', label: { zh: '接收仓库里的评论', en: 'Receive comments in the repository' },
       hint: { zh: '打开后，Issue 和 PR 上没有 @ 智能体的评论和代码评论也会收到，由策略的接收表决定是否成为候选。', en: 'Comments and review comments on Issues and PRs that do not mention the agent are received too, and the Policy\'s admission table decides whether they become candidates.' } },
     { key: 'observeCi', type: 'switch', label: { zh: '接收默认分支的 CI', en: 'Receive the default branch\'s CI' },
-      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } }],
+      hint: { zh: '打开后，默认分支的 CI 失败和恢复会收到，由策略的接收表决定是否成为候选。', en: 'Failures of the default branch\'s CI, and its recovery, are received, and the Policy\'s admission table decides whether they become candidates.' } },
+    // A Source that mirrors an outside event into GitHub opens its Issue as the agent, which
+    // would otherwise be skipped as the agent's own answer. These labels are the exception.
+    { key: 'ownLabels', type: 'text', advanced: true, label: { zh: '智能体自己开的、仍要接收的 Issue 标签', en: 'Labels that let the agent\'s own Issues through' },
+      hint: { zh: '逗号分隔。由另一个来源镜像进来的 Issue 带有这些标签时不会被当作智能体自己的回复跳过，而是作为机器人候选交给策略；策略的机器人名单仍要包含智能体账号。留空则关闭。', en: 'Comma-separated. An Issue the agent opened that carries one of these is not skipped as its own reply but continues as a bot candidate for the Policy, whose bot list must still name the agent account. Empty disables the exception.' } }],
   // What the Source observes across the repository it receives in full; elsewhere, only what addresses the agent.
-  scope: ({ meta }, config) => {
-    const row = scopeOf(meta)
+  scope: ({ meta }, config) => {    const row = scopeOf(meta)
     return { listened: true, observed: row !== undefined && config[OBSERVED[row]], ...row ? { row } : {} }
   },
   health: ['github'],
@@ -224,7 +246,13 @@ async function readStream(ctx: SourceContext, round: Round, id: string, path: st
   for (const item of items) {
     // Stopping mid-stream aborts before advancing the cursor so unread items are retried.
     if (stopped(ctx, round)) throw new Error('The GitHub Source stopped during the poll')
-    if (sameName(item.user.login, login)) continue
+    // The agent's own writes are its answers, not requests, so they are normally skipped
+    // before they can become Triggers. A Source that mirrors an outside event into GitHub
+    // (the Sentry Source does) has no other way in: its Issue is authored by the agent, and
+    // the skip happens here, before any Policy list is consulted. `ownLabels` names the
+    // labels that mark such an Issue, which then continues as an ordinary bot candidate —
+    // still not a person's request, so the Policy's `bots` list decides whether it may work.
+    if (sameName(item.user.login, login) && !carriesLabel(item, config.ownLabels)) continue
     if (id === 'issues') {
       const issue = IssueSchema.safeParse(item)
       const pr = issue.success && !!issue.data.pull_request

@@ -8,7 +8,7 @@ import { runFeishu } from '../src/sources/feishu-loops.ts'
 import { commentTrigger, githubAddress, githubChannel, issueTrigger, type GithubComment, type GithubIssue } from '../src/sources/github-trigger.ts'
 import { claimPull, observePull, pullEndNotices, pullOf, ticketBranch, type Pull } from '../src/sources/github-pull.ts'
 import { ciCounts, ciFact, ciSummary } from '../src/sources/github-read.ts'
-import { apply as applyGithub, githubKind, pollFailure, pollRound } from '../src/sources/github.ts'
+import { apply as applyGithub, carriesLabel, githubKind, pollFailure, pollRound } from '../src/sources/github.ts'
 import { pollThreads as pollGithubThreads } from '../src/sources/github.ts'
 import { SourceRegistry } from '../src/sources/registry.ts'
 import { cursorAt, POLL_HORIZON_MS } from '../src/sources/poll.ts'
@@ -1024,7 +1024,7 @@ it('reports GitHub as failing only after the configured number of consecutive fa
   expect(pollFailure(2, 3, eof)).toBeUndefined()
   expect(pollFailure(3, 3, eof)).toEqual({ state: 'error', detail: '3 consecutive failed polls; last: Error: Get "https://api.github.com/x": EOF', code: 'pollFailures', values: { count: '3', error: 'Error: Get "https://api.github.com/x": EOF' } })
   expect(githubKind.schema.parse({})).toEqual({ repository: '', cli: '', pollSeconds: 60, failuresBeforeError: 3, observeIssues: false,
-    observePulls: false, observeComments: false, observeCi: false })
+    observePulls: false, observeComments: false, observeCi: false, ownLabels: '' })
 })
 describe('feishu event consumer', () => {
   let dir: string
@@ -1243,6 +1243,39 @@ describe('observing the GitHub repository', () => {
     await pollRound(h)
     expect(h.store.get('github-stream:issues')).toBeUndefined()
     h.store.close()
+  })
+  it('receives an Issue the agent itself opened when it carries one of the configured own labels', async () => {
+    // The skip above happens before any Policy list is consulted, so a Source that mirrors an
+    // outside event into GitHub (the Sentry Source) cannot get in through `bots` alone. The
+    // label is the only signal available at that point.
+    const h = host()
+    h.store.saveSettings({ ...h.store.settings(), sources: { ...h.store.settings().sources,
+      github: { enabled: true, config: { observeIssues: true, ownLabels: 'sentry' } } } })
+    h.store.set('github-since', at(-24))
+    h.store.set('github-stream:issues', { since: at(0), started: { issues: at(0), pulls: at(0) } })
+    const mine = { login: 'agent-bot', type: 'User' }
+    repository(h, { issues: [
+      issue(7, { created_at: at(2), updated_at: at(2), user: mine, labels: [{ name: 'sentry' }] } as never),
+      issue(8, { created_at: at(3), updated_at: at(3), user: mine, labels: [{ name: 'chore' }] } as never),
+      issue(9, { created_at: at(4), updated_at: at(4), user: mine } as never),
+    ] })
+    await pollRound(h)
+    // #7 carries the configured label; #8 carries another one and #9 none, so both stay skipped.
+    expect(h.receive.mock.calls.map(([trigger]) => trigger.meta.number)).toEqual([7])
+    // It is still not a person's request, so the Policy's bot list — not the allowed list — decides.
+    expect(h.receive.mock.calls[0]![0].human).toBe(false)
+    h.store.close()
+  })
+  it('matches own labels by name and ignores an empty configuration', () => {
+    const item = { labels: [{ name: 'Sentry' }, { name: 'other' }] }
+    expect(carriesLabel(item, 'sentry')).toBe(true)
+    expect(carriesLabel(item, 'chore, sentry')).toBe(true)
+    expect(carriesLabel(item, 'chore')).toBe(false)
+    // Empty configuration must not turn the self-echo guard off for everything.
+    expect(carriesLabel(item, '')).toBe(false)
+    expect(carriesLabel(item, '   ')).toBe(false)
+    expect(carriesLabel({}, 'sentry')).toBe(false)
+    expect(carriesLabel(null, 'sentry')).toBe(false)
   })
   it('takes in the repository\'s conversation and review comments, on the Issue or PR each is on', async () => {
     const h = host()
