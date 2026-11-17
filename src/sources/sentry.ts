@@ -59,8 +59,10 @@ const ConfigSchema = z.object({
   project: z.string().regex(/^[a-z0-9._-]+$/i).default(''),
   /** Name of the environment variable holding the Sentry auth token. */
   tokenEnv: z.string().regex(/^[A-Z][A-Z0-9_]*$/).default('SENTRY_AUTH_TOKEN'),
-  /** Only mirror Issues with at least this many users affected; 1 disables the check. */
+  /** Mirror an Issue with at least this many affected users; 1 disables the check. */
   minUsers: z.number().int().min(1).max(1000).default(2),
+  /** Mirror an Issue with at least this many events; 1 disables the check. */
+  minEvents: z.number().int().min(1).max(1_000_000).default(10),
   /** Comma-separated labels applied to the created GitHub Issue. */
   labels: z.string().default('sentry'),
   /** Extra Sentry search terms appended to the fixed query. */
@@ -127,16 +129,24 @@ function hasRepository(ctx: SourceContext): boolean {
  * reason for skipping is visible in one place: these rules are the difference
  * between a useful agent and one that files Pull Requests for other people's
  * browser extensions.
+ *
+ * The thresholds are an OR, not an AND, because the two kinds of project report
+ * differently. A front-end error reaches many users at once, so `userCount` is the
+ * signal. A back-end error is reported by a Worker and usually affects a single
+ * indistinguishable "user", so a repeated failure that runs 1,000 times has
+ * `userCount === 1` and would be rejected by any user floor — while a genuine
+ * transient (one "network connection lost") has the same count and should be. Event
+ * count separates them; affected users do not.
  */
 export function admit(
   issue: SentryIssue,
-  config: Pick<SentryConfig, 'minUsers' | 'ignore'>,
+  config: Pick<SentryConfig, 'minUsers' | 'minEvents' | 'ignore'>,
 ): boolean {
   // A handled exception is one the application already reacted to; only unhandled
   // crashes reach here, so an explicit `handled=true` tag means someone swallowed it.
   if (issue.handled === 'true') return false;
-  // Below the noise floor: a single user's transient failure is not work.
-  if (issue.userCount < config.minUsers) return false;
+  // Below the noise floor on both axes: neither many users nor many events.
+  if (issue.userCount < config.minUsers && issue.count < config.minEvents) return false;
   const patterns = config.ignore
     .split('\n')
     .map(line => line.trim())
@@ -234,6 +244,17 @@ export const sentryKind: SourceKind<SentryConfig> = {
       hint: {
         zh: '单个用户的瞬时错误通常不该变成工作。置为 1 关闭此过滤。',
         en: 'A single user\'s transient failure is usually not work. Set 1 to disable this filter.',
+      },
+    },
+    {
+      key: 'minEvents',
+      type: 'number',
+      min: 1,
+      max: 1000000,
+      label: { zh: '至少发生几次才镜像', en: 'Minimum events' },
+      hint: {
+        zh: '与用户数取"或"：后端的 Worker 错误往往只影响 1 个用户，但重复上千次。置为 1 关闭此过滤。',
+        en: 'An OR with the user floor: a back-end Worker error usually affects one user but repeats thousands of times. Set 1 to disable this filter.',
       },
     },
     {

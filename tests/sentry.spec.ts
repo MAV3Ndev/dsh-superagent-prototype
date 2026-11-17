@@ -104,27 +104,40 @@ describe('sentry source: configuration', () => {
 })
 
 describe('sentry source: admission', () => {
-  const base = config({ minUsers: 2 })
+  const base = config({ minUsers: 2, minEvents: 10 })
 
   it('admits an unhandled error that affects several users', async () => {
     expect(admit(await one(), base)).toBe(true)
+  })
+
+  it('admits a repeated back-end failure that affects only one user', async () => {
+    // Verified against the real projects: a Worker failure that runs 1,251 times
+    // reports userCount 1, and a user floor alone would reject it while admitting the
+    // genuine transient next to it. Event count is what separates the two.
+    const repeated = await one({ userCount: 1, count: '1251', title: 'Error: SCHEDULED_JOBS_FAILED:1' })
+    expect(admit(repeated, base)).toBe(true)
+  })
+
+  it('rejects a one-off back-end failure as transient noise', async () => {
+    const blip = await one({ userCount: 1, count: '1', title: 'Error: D1_ERROR: Network connection lost.' })
+    expect(admit(blip, base)).toBe(false)
   })
 
   it('rejects an exception the application already handled', async () => {
     expect(admit(await one({ tags: [{ key: 'handled', value: 'true' }] }), base)).toBe(false)
   })
 
-  it('rejects a single-user failure as below the noise floor', async () => {
-    expect(admit(await one({ userCount: 1 }), base)).toBe(false)
+  it('rejects a single-user, single-event failure as below the noise floor', async () => {
+    expect(admit(await one({ userCount: 1, count: '1' }), base)).toBe(false)
   })
 
   it('rejects titles matching an ignore pattern, and keeps going past an invalid one', async () => {
-    const noise = config({ minUsers: 2, ignore: 'NetworkError\nFailed to fetch' })
-    const real = config({ minUsers: 2, ignore: '[' })
-    const network = await one({ userCount: 9, metadata: { type: 'NetworkError', value: 'Failed to fetch' } })
+    const noise = config({ minUsers: 2, minEvents: 10, ignore: 'NetworkError\nFailed to fetch' })
+    const real = config({ minUsers: 2, minEvents: 10, ignore: '[' })
+    const network = await one({ userCount: 9, count: '99', metadata: { type: 'NetworkError', value: 'Failed to fetch' } })
     expect(admit(network, noise)).toBe(false)
     // An operator's typo in one pattern must not turn the whole Source off.
-    const genuine = await one({ userCount: 9, title: 'DatabaseError', metadata: { type: 'DatabaseError' } })
+    const genuine = await one({ userCount: 9, count: '99', title: 'DatabaseError', metadata: { type: 'DatabaseError' } })
     expect(admit(genuine, real)).toBe(true)
   })
 })
